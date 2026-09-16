@@ -51,3 +51,15 @@ warmup_style: null
 # override_optimizer_config:
 #   bf16_stochastic_round: true
 override_optimizer_config: null
+
+
+topk_svd_enabled: false
+topk_svd_ratio: 0.10
+topk_svd_multiplier: 2.0
+
+
+# Layer-wise learning-rate experiment
+layerwise_lr_enabled: false
+middle_lr_multiplier: 2.0
+middle_layer_start_frac: 0.3333333333
+middle_layer_end_frac: 0.6666666667

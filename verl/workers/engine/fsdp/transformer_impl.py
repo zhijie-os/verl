@@ -15,6 +15,77 @@
 The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
+import math
+import torch
+import re
+
+@torch.no_grad()
+def amplify_topk_svd_grad_(
+    grad: torch.Tensor,
+    topk_ratio: float = 0.10,
+    multiplier: float = 2.0,
+):
+    """
+    Decompose a 2-D gradient:
+
+        G = G_top + G_tail
+
+    then replace it with:
+
+        G' = multiplier * G_top + G_tail
+
+    where G_top contains the first topk_ratio fraction
+    of singular components.
+    """
+
+    if grad is None or grad.ndim != 2:
+        return False
+
+    if not 0.0 < topk_ratio <= 1.0:
+        raise ValueError(f"topk_ratio must be in (0, 1], got {topk_ratio}")
+
+    if multiplier <= 0:
+        raise ValueError(f"multiplier must be > 0, got {multiplier}")
+
+    original_dtype = grad.dtype
+
+    # SVD in fp32 for numerical stability.
+    G = grad.detach().float()
+
+    # Don't run SVD on NaN/Inf gradients.
+    if not torch.isfinite(G).all():
+        return False
+
+    rank = min(G.shape)
+    k = max(1, math.ceil(topk_ratio * rank))
+
+    # Exact SVD.
+    # Singular values are returned in descending order.
+    U, S, Vh = torch.linalg.svd(
+        G,
+        full_matrices=False,
+    )
+
+    U_k = U[:, :k]
+    S_k = S[:k]
+    Vh_k = Vh[:k, :]
+
+    # G_top = U_k @ diag(S_k) @ Vh_k
+    G_top = (U_k * S_k.unsqueeze(0)) @ Vh_k
+
+    # G' = G + (multiplier - 1) * G_top
+    #
+    # Since:
+    # G = G_top + G_tail,
+    #
+    # this gives:
+    # G' = multiplier * G_top + G_tail
+    G.add_(G_top, alpha=multiplier - 1.0)
+
+    grad.copy_(G.to(dtype=original_dtype))
+
+    return True
+
 import gc
 import logging
 import os
@@ -198,6 +269,82 @@ class FSDPEngine(BaseEngine):
         else:
             is_collect = True
         return is_collect
+
+
+
+    @torch.no_grad()
+    def _apply_topk_svd_gradients(
+        self,
+        topk_ratio: float,
+        multiplier: float,
+    ):
+        modified = 0
+        skipped_nonfinite = 0
+
+        for name, param in self.module.named_parameters():
+
+            if param.grad is None:
+                continue
+
+            grad = param.grad
+
+            # --------------------------------------------------------
+            # This experiment is defined on each original 2-D
+            # Transformer weight matrix.
+            # --------------------------------------------------------
+            if grad.ndim != 2:
+                continue
+
+            # Restrict to attention + MLP matrices, matching the
+            # kinds of matrices analyzed by the paper.
+            if "self_attn" not in name and ".mlp." not in name:
+                continue
+
+            # --------------------------------------------------------
+            # Important:
+            # We need the FULL gradient matrix for the SVD.
+            #
+            # SVD'ing independent FSDP shards would define a different
+            # algorithm.
+            # --------------------------------------------------------
+            if isinstance(grad, DTensor):
+                raise RuntimeError(
+                    f"[TopK-SVD] {name} is a DTensor with shape "
+                    f"{tuple(grad.shape)}. "
+                    "The Top-k experiment requires the full 2-D gradient "
+                    "matrix. For the initial experiment use FSDP1, "
+                    "fsdp_size=1 and use_orig_params=true."
+                )
+
+            if not torch.isfinite(grad).all():
+                skipped_nonfinite += 1
+                continue
+
+            changed = amplify_topk_svd_grad_(
+                grad,
+                topk_ratio=topk_ratio,
+                multiplier=multiplier,
+            )
+
+            if changed:
+                modified += 1
+
+        # Never silently run an experiment that modified nothing.
+        if modified == 0:
+            raise RuntimeError(
+                "[TopK-SVD] enabled, but zero 2-D attention/MLP gradients "
+                "were modified. Check FSDP sharding, use_orig_params, "
+                "and parameter names."
+            )
+
+        if self.rank == 0:
+            print(
+                f"[TopK-SVD] modified={modified}, "
+                f"ratio={topk_ratio}, "
+                f"multiplier={multiplier}, "
+                f"nonfinite_skipped={skipped_nonfinite}"
+            )
+
 
     def initialize(self):
         """
@@ -491,9 +638,105 @@ class FSDPEngine(BaseEngine):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        # ------------------------------------------------------------
+        # Normal VERL behavior
+        # ------------------------------------------------------------
+        if not self.optimizer_config.layerwise_lr_enabled:
+            return build_optimizer(
+                module.parameters(),
+                self.optimizer_config,
+            )
 
-        return optimizer
+        # ------------------------------------------------------------
+        # Layer-wise LR experiment
+        #
+        # Example for 28 layers:
+        #
+        #   0-8   -> base LR
+        #   9-18  -> higher LR
+        #   19-27 -> base LR
+        # ------------------------------------------------------------
+        num_layers = self.model_config.hf_config.num_hidden_layers
+
+        start_frac = self.optimizer_config.middle_layer_start_frac
+        end_frac = self.optimizer_config.middle_layer_end_frac
+
+        middle_start = math.floor(num_layers * start_frac)
+        middle_end = math.ceil(num_layers * end_frac)  # exclusive
+
+        base_lr = self.optimizer_config.lr
+
+        middle_lr = (
+            base_lr
+            * self.optimizer_config.middle_lr_multiplier
+        )
+
+        base_params = []
+        middle_params = []
+
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Examples this matches:
+            #
+            # model.layers.9.self_attn.q_proj.weight
+            # model.layers.12.mlp.up_proj.weight
+            #
+            # It also tolerates prefixes added by wrappers.
+            match = re.search(
+                r"(?:^|\.)layers\.(\d+)\.",
+                name,
+            )
+
+            if match is not None:
+                layer_idx = int(match.group(1))
+
+                if middle_start <= layer_idx < middle_end:
+                    middle_params.append(param)
+                    continue
+
+            # Everything else gets normal LR:
+            #
+            # - bottom layers
+            # - top layers
+            # - embeddings
+            # - lm_head
+            # - norms outside transformer blocks
+            base_params.append(param)
+
+        if len(middle_params) == 0:
+            raise RuntimeError(
+                "[LayerLR] enabled but no middle-layer parameters "
+                "were found. Check parameter names and "
+                "FSDP use_orig_params."
+            )
+
+        param_groups = [
+            {
+                "params": base_params,
+                "lr": base_lr,
+            },
+            {
+                "params": middle_params,
+                "lr": middle_lr,
+            },
+        ]
+
+        if self.rank == 0:
+            print(
+                f"[LayerLR] num_layers={num_layers}, "
+                f"middle=[{middle_start}, {middle_end - 1}], "
+                f"base_lr={base_lr:.3e}, "
+                f"middle_lr={middle_lr:.3e}, "
+                f"base_params={len(base_params)}, "
+                f"middle_params={len(middle_params)}"
+            )
+
+        return build_optimizer(
+            param_groups,
+            self.optimizer_config,
+        )
 
     def _build_lr_scheduler(self, optimizer):
         from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -796,6 +1039,16 @@ class FSDPEngine(BaseEngine):
         # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
         if scaler is not None:
             scaler.unscale_(self.optimizer)
+        
+
+        # ==========================================
+        # Lin experiment: per-step Top-10% SVD
+        # ==========================================
+        if self.optimizer_config.topk_svd_enabled:
+            self._apply_topk_svd_gradients(
+                topk_ratio=self.optimizer_config.topk_svd_ratio,
+                multiplier=self.optimizer_config.topk_svd_multiplier,
+            )
 
         if isinstance(self.module, FSDP):
             grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)

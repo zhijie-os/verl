@@ -113,6 +113,21 @@ class FSDPOptimizerConfig(OptimizerConfig):
     override_optimizer_config: Optional[dict] = None
     zero_indexed_step: bool = True
 
+    # ============================================================
+    # Top-k SVD gradient experiment
+    # ============================================================
+    topk_svd_enabled: bool = False
+    topk_svd_ratio: float = 0.10
+    topk_svd_multiplier: float = 2.0
+
+    # ============================================================
+    # Layer-wise learning-rate experiment
+    # ============================================================
+    layerwise_lr_enabled: bool = False
+    middle_lr_multiplier: float = 2.0
+    middle_layer_start_frac: float = 1.0 / 3.0
+    middle_layer_end_frac: float = 2.0 / 3.0
+
     def __post_init__(self):
         if self.warmup_style is not None:
             assert self.warmup_style in ["constant", "cosine"]
