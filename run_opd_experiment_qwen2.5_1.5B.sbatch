@@ -73,7 +73,7 @@ case "${MODEL_SIZE}" in
         ;;
 
     1.5B)
-        MODEL_PATH="/home/zhijiex/models/Qwen2.5-1.5B-Instruct"
+        MODEL_PATH="/home/zhijiex/models/Qwen2.5-Math-1.5B-Instruct"
 
         PPO_MICRO_BATCH_SIZE=2
         LOGPROB_MICRO_BATCH_SIZE=4
