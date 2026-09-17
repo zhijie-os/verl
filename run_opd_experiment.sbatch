@@ -345,6 +345,7 @@ srun env \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
+    trainer.val_before_train=True \
     trainer.test_freq=10 \
     trainer.total_epochs=${TOTAL_EPOCHS}
 

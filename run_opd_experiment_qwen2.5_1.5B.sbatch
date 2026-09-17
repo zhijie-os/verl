@@ -1,4 +1,3 @@
-(ENV) zhijiex@vulcan3:~/verl$ cat run_opd_experiment.sbatch
 #!/bin/bash
 #SBATCH --job-name=opd-rl
 #SBATCH --nodes=1
