@@ -3,9 +3,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
+#SBATCH --mem=128G
 #SBATCH --gpus-per-node=l40s:1
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/home/zhijiex/verl/logs/%x-%j.out
 #SBATCH --error=/home/zhijiex/verl/logs/%x-%j.err
 
@@ -28,6 +28,7 @@ set -euo pipefail
 #   sbatch run_opd_experiment.sbatch 1.7B both
 #
 # ============================================================
+
 if [[ $# -ne 2 ]]; then
     echo "Usage: sbatch $0 <0.6B|1.7B> <baseline|layerwise|topk|both>"
     exit 1
@@ -38,9 +39,7 @@ EXPERIMENT="$2"
 
 # ============================================================
 # Alliance modules
-#
-# IMPORTANT:
-# Modules must be loaded BEFORE activating the virtualenv.
+# IMPORTANT: load BEFORE activating virtualenv
 # ============================================================
 
 module load python/3.11
@@ -53,14 +52,14 @@ module load opencv/4.14.0
 # ============================================================
 
 cd /home/zhijiex/verl
-
 source /home/zhijiex/verl/VERL/bin/activate
 
+export HYDRA_FULL_ERROR=1
 
 mkdir -p /home/zhijiex/verl/logs
 
 # ============================================================
-# Model + model-dependent memory settings
+# Model-dependent settings
 # ============================================================
 
 case "${MODEL_SIZE}" in
@@ -68,7 +67,6 @@ case "${MODEL_SIZE}" in
     0.6B)
         MODEL_PATH="/home/zhijiex/models/Qwen3-0.6B"
 
-        # 0.6B should be comfortable on a 48 GB L40
         PPO_MICRO_BATCH_SIZE=2
         LOGPROB_MICRO_BATCH_SIZE=4
         ROLLOUT_GPU_MEMORY_UTILIZATION=0.35
@@ -77,10 +75,9 @@ case "${MODEL_SIZE}" in
     1.7B)
         MODEL_PATH="/home/zhijiex/models/Qwen3-1.7B"
 
-        # More conservative for one 48 GB L40
-        PPO_MICRO_BATCH_SIZE=1
-        LOGPROB_MICRO_BATCH_SIZE=2
-        ROLLOUT_GPU_MEMORY_UTILIZATION=0.25
+        PPO_MICRO_BATCH_SIZE=2
+        LOGPROB_MICRO_BATCH_SIZE=4
+        ROLLOUT_GPU_MEMORY_UTILIZATION=0.35
         ;;
 
     *)
@@ -88,7 +85,6 @@ case "${MODEL_SIZE}" in
         echo "Expected: 0.6B or 1.7B"
         exit 1
         ;;
-
 esac
 
 if [[ ! -d "${MODEL_PATH}" ]]; then
@@ -128,14 +124,9 @@ case "${EXPERIMENT}" in
 
     *)
         echo "ERROR: unknown EXPERIMENT=${EXPERIMENT}"
-        echo "Expected:"
-        echo "  baseline"
-        echo "  layerwise"
-        echo "  topk"
-        echo "  both"
+        echo "Expected: baseline, layerwise, topk, or both"
         exit 1
         ;;
-
 esac
 
 # ============================================================
@@ -171,9 +162,13 @@ MAX_RESPONSE_LENGTH=1024
 
 ROLLOUT_N=4
 
-# ------------------------------------------------------------
-# Our two experimental features
-# ------------------------------------------------------------
+# 1 epoch ~= 233 steps
+# 2 epochs ~= 466 steps
+TOTAL_EPOCHS=2
+
+# ============================================================
+# Experimental feature settings
+# ============================================================
 
 TOPK_SVD_RATIO=0.10
 TOPK_SVD_MULTIPLIER=2.0
@@ -182,18 +177,12 @@ MIDDLE_LR_MULTIPLIER=2.0
 MIDDLE_LAYER_START_FRAC=0.3333333333
 MIDDLE_LAYER_END_FRAC=0.6666666667
 
-# Qwen3-0.6B and 1.7B both have 28 transformer layers.
+# Both Qwen3-0.6B and Qwen3-1.7B have 28 transformer layers.
 #
-# With these fractions:
+# floor(28 * 1/3) = 9
+# ceil (28 * 2/3) = 19
 #
-#   start = floor(28 * 1/3) = 9
-#   end   = ceil (28 * 2/3) = 19
-#
-# therefore middle layers are:
-#
-#   9 ... 18
-#
-# ============================================================
+# Middle layers = 9 ... 18
 
 EXPERIMENT_NAME="${EXPERIMENT}_qwen3_${MODEL_SIZE}"
 
@@ -224,9 +213,10 @@ echo
 echo "Train batch size:      ${TRAIN_BATCH_SIZE}"
 echo "PPO mini batch:        ${PPO_MINI_BATCH_SIZE}"
 echo "PPO micro batch/GPU:   ${PPO_MICRO_BATCH_SIZE}"
-echo
 echo "Rollout n:             ${ROLLOUT_N}"
 echo "vLLM GPU utilization:  ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
+echo "Total epochs:          ${TOTAL_EPOCHS}"
+echo "Expected steps:        ~466"
 echo
 echo "Train dataset:         ${TRAIN_FILE}"
 echo "Validation dataset:    ${VAL_FILE}"
@@ -271,10 +261,21 @@ print("OpenCV:         ", cv2.__version__)
 print()
 PY
 
+echo
+echo "TensorBoard:"
+python - <<'PY'
+try:
+    import tensorboard
+    print("TensorBoard:", tensorboard.__version__)
+except ImportError:
+    raise SystemExit(
+        "ERROR: tensorboard is not installed in the VERL environment."
+    )
+PY
+
+echo
 echo "nvidia-smi:"
 nvidia-smi
-
-
 
 echo
 echo "============================================================"
@@ -292,6 +293,7 @@ srun env \
     python -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
+    \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
@@ -302,6 +304,7 @@ srun env \
     \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
@@ -336,14 +339,14 @@ srun env \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOGPROB_MICRO_BATCH_SIZE} \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     \
-    trainer.logger=console \
+    trainer.logger='["console","tensorboard"]' \
     trainer.project_name=opd_rl \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=1
+    trainer.test_freq=10 \
+    trainer.total_epochs=${TOTAL_EPOCHS}
 
 echo
 echo "============================================================"
