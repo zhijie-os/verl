@@ -30,7 +30,7 @@ set -euo pipefail
 # ============================================================
 
 if [[ $# -ne 2 ]]; then
-    echo "Usage: sbatch $0 <0.6B|1.5B> <baseline|layerwise|topk|both>"
+    echo "Usage: sbatch $0 <0.6B|1.5B> <baseline|global2x|layerwise|topk|both>"
     exit 1
 fi
 
@@ -107,6 +107,11 @@ case "${EXPERIMENT}" in
         LAYERWISE=false
         ;;
 
+    global2x)
+        TOPK=false
+        LAYERWISE=false
+        ;;
+
     layerwise)
         TOPK=false
         LAYERWISE=true
@@ -124,7 +129,7 @@ case "${EXPERIMENT}" in
 
     *)
         echo "ERROR: unknown EXPERIMENT=${EXPERIMENT}"
-        echo "Expected: baseline, layerwise, topk, or both"
+        echo "Expected: baseline, global2x, layerwise, topk, or both"
         exit 1
         ;;
 esac
@@ -153,6 +158,10 @@ fi
 # ============================================================
 
 ACTOR_LR=5e-7
+
+if [[ "${EXPERIMENT}" == "global2x" ]]; then
+    ACTOR_LR=1e-6
+fi
 
 TRAIN_BATCH_SIZE=32
 PPO_MINI_BATCH_SIZE=16
