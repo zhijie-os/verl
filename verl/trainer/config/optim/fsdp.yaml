@@ -63,3 +63,11 @@ layerwise_lr_enabled: false
 middle_lr_multiplier: 2.0
 middle_layer_start_frac: 0.3333333333
 middle_layer_end_frac: 0.6666666667
+
+
+# Top-k-energy adaptive layer learning-rate experiment
+adaptive_layer_lr_enabled: false
+adaptive_layer_lr_interval: 10
+adaptive_layer_lr_topk_ratio: 0.10
+adaptive_layer_lr_max_multiplier: 2.0
+adaptive_layer_lr_ema_beta: 0.90

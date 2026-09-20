@@ -99,6 +99,7 @@ fi
 
 TOPK=false
 LAYERWISE=false
+ADAPTIVE=false
 
 case "${EXPERIMENT}" in
 
@@ -120,6 +121,12 @@ case "${EXPERIMENT}" in
     both)
         TOPK=true
         LAYERWISE=true
+        ;;
+
+    adaptive)
+        TOPK=false
+        LAYERWISE=false
+        ADAPTIVE=true
         ;;
 
     *)
@@ -326,6 +333,11 @@ srun env \
     actor_rollout_ref.actor.optim.middle_lr_multiplier=${MIDDLE_LR_MULTIPLIER} \
     actor_rollout_ref.actor.optim.middle_layer_start_frac=${MIDDLE_LAYER_START_FRAC} \
     actor_rollout_ref.actor.optim.middle_layer_end_frac=${MIDDLE_LAYER_END_FRAC} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_enabled=${ADAPTIVE} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_interval=10 \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_topk_ratio=0.10 \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_max_multiplier=2.0 \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_ema_beta=0.90 \
     \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \

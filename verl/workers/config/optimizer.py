@@ -128,6 +128,17 @@ class FSDPOptimizerConfig(OptimizerConfig):
     middle_layer_start_frac: float = 1.0 / 3.0
     middle_layer_end_frac: float = 2.0 / 3.0
 
+
+    # ============================================================
+    # Top-k-energy adaptive layer learning-rate experiment
+    # ============================================================
+    adaptive_layer_lr_enabled: bool = False
+    adaptive_layer_lr_interval: int = 10
+    adaptive_layer_lr_topk_ratio: float = 0.10
+    adaptive_layer_lr_max_multiplier: float = 2.0
+    adaptive_layer_lr_ema_beta: float = 0.90
+
+
     def __post_init__(self):
         if self.warmup_style is not None:
             assert self.warmup_style in ["constant", "cosine"]

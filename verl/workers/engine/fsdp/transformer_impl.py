@@ -344,6 +344,191 @@ class FSDPEngine(BaseEngine):
                 f"multiplier={multiplier}, "
                 f"nonfinite_skipped={skipped_nonfinite}"
             )
+        
+
+    @torch.no_grad()
+    def _compute_adaptive_layer_scores(
+        self,
+        topk_ratio: float,
+    ):
+        """
+        Compute dominant-update energy for each Transformer layer.
+
+        IMPORTANT:
+        This does NOT modify gradients.
+
+        For every 2-D attention/MLP gradient matrix G:
+            G = U diag(S) V^T
+
+        Keep the largest topk_ratio fraction of singular values and
+        accumulate their squared energy for the corresponding layer.
+        """
+
+        num_layers = self.model_config.hf_config.num_hidden_layers
+
+        device = next(self.module.parameters()).device
+
+        layer_energy = torch.zeros(
+            num_layers,
+            device=device,
+            dtype=torch.float64,
+        )
+
+        for name, param in self.module.named_parameters():
+
+            if param.grad is None:
+                continue
+
+            grad = param.grad
+
+            if grad.ndim != 2:
+                continue
+
+            # Same matrices as your existing Top-k experiment.
+            if "self_attn" not in name and ".mlp." not in name:
+                continue
+
+            match = re.search(
+                r"(?:^|\.)layers\.(\d+)\.",
+                name,
+            )
+
+            if match is None:
+                continue
+
+            layer_idx = int(match.group(1))
+
+            if isinstance(grad, DTensor):
+                raise RuntimeError(
+                    f"[AdaptiveLayerLR] {name} is a DTensor. "
+                    "Use fsdp_size=1 and use_orig_params=true."
+                )
+
+            G = grad.detach().float()
+
+            if not torch.isfinite(G).all():
+                continue
+
+            # We only need singular values.
+            S = torch.linalg.svdvals(G)
+
+            k = max(
+                1,
+                math.ceil(topk_ratio * S.numel()),
+            )
+
+            # ||G_top||_F^2 = sum of squared top singular values
+            layer_energy[layer_idx] += torch.sum(
+                S[:k].double() ** 2
+            )
+
+        # Equivalent to Frobenius norm of all dominant
+        # update components in the layer.
+        layer_scores = torch.sqrt(layer_energy)
+
+        return layer_scores
+
+
+    @torch.no_grad()
+    def _update_adaptive_layer_lr(self):
+        cfg = self.optimizer_config
+
+        scores = self._compute_adaptive_layer_scores(
+            topk_ratio=cfg.adaptive_layer_lr_topk_ratio,
+        )
+
+        # ------------------------------------------------------------
+        # EMA across measurements
+        # ------------------------------------------------------------
+        beta = cfg.adaptive_layer_lr_ema_beta
+
+        if self._adaptive_layer_score_ema is None:
+            self._adaptive_layer_score_ema = scores.clone()
+        else:
+            self._adaptive_layer_score_ema.mul_(beta).add_(
+                scores,
+                alpha=1.0 - beta,
+            )
+
+        scores = self._adaptive_layer_score_ema
+
+        # ------------------------------------------------------------
+        # Normalize scores across depth
+        # ------------------------------------------------------------
+        score_min = scores.min()
+        score_max = scores.max()
+
+        normalized = (
+            (scores - score_min)
+            / (score_max - score_min + 1e-12)
+        )
+
+        # 0 -> 1x LR
+        # 1 -> max_multiplier LR
+        max_multiplier = cfg.adaptive_layer_lr_max_multiplier
+        multipliers = (
+            1.0
+            + normalized * (max_multiplier - 1.0)
+        )
+
+        # Store the profile. The scheduler remains responsible for the
+        # global LR schedule; these multipliers are reapplied afterward.
+        self._adaptive_lr_multipliers = (
+            multipliers.detach().cpu().tolist()
+        )
+
+        # Apply the newly measured profile to the current optimizer step.
+        self._apply_adaptive_layer_lr()
+
+        if self.rank == 0:
+            score_text = ", ".join(
+                f"{x:.6e}"
+                for x in scores.tolist()
+            )
+            multiplier_text = ", ".join(
+                f"{x:.3f}"
+                for x in multipliers.tolist()
+            )
+
+            print(
+                f"[AdaptiveLayerLR] step={self._adaptive_lr_step} "
+                f"scores=[{score_text}] "
+                f"multipliers=[{multiplier_text}]"
+            )
+
+    @torch.no_grad()
+    def _apply_adaptive_layer_lr(self):
+        """Apply the currently stored per-layer LR multipliers.
+
+        The LR scheduler owns the global learning-rate schedule. This method
+        multiplies each Transformer layer's scheduler-produced LR by its
+        stored adaptive factor while keeping non-layer parameters at the
+        scheduler-produced base LR.
+        """
+        if self._adaptive_lr_multipliers is None:
+            return
+
+        scheduled_lrs = self.lr_scheduler.get_last_lr()
+
+        if len(scheduled_lrs) != len(self.optimizer.param_groups):
+            raise RuntimeError(
+                "[AdaptiveLayerLR] scheduler/optimizer parameter-group "
+                "count mismatch."
+            )
+
+        for group_idx, group in enumerate(self.optimizer.param_groups):
+            layer_idx = group.get("layer_idx", -1)
+            scheduled_lr = scheduled_lrs[group_idx]
+
+            if layer_idx < 0:
+                # Embeddings, final norm, lm_head, etc. stay at base LR.
+                group["lr"] = scheduled_lr
+                continue
+
+            group["lr"] = (
+                scheduled_lr
+                * self._adaptive_lr_multipliers[layer_idx]
+            )
 
 
     def initialize(self):
@@ -637,6 +822,76 @@ class FSDPEngine(BaseEngine):
 
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
+
+
+        # ============================================================
+        # Adaptive layer-LR experiment
+        # ============================================================
+        if self.optimizer_config.adaptive_layer_lr_enabled:
+            num_layers = self.model_config.hf_config.num_hidden_layers
+            base_lr = self.optimizer_config.lr
+
+            layer_params = [[] for _ in range(num_layers)]
+            other_params = []
+
+            for name, param in module.named_parameters():
+                if not param.requires_grad:
+                    continue
+
+                match = re.search(
+                    r"(?:^|\.)layers\.(\d+)\.",
+                    name,
+                )
+
+                if match is None:
+                    other_params.append(param)
+                    continue
+
+                layer_idx = int(match.group(1))
+                layer_params[layer_idx].append(param)
+
+            param_groups = []
+
+            for layer_idx in range(num_layers):
+                if len(layer_params[layer_idx]) == 0:
+                    raise RuntimeError(
+                        f"[AdaptiveLayerLR] no parameters found "
+                        f"for layer {layer_idx}"
+                    )
+
+                param_groups.append(
+                    {
+                        "params": layer_params[layer_idx],
+                        "lr": base_lr,
+                        "layer_idx": layer_idx,
+                    }
+                )
+
+            # embeddings, final norm, lm_head, etc.
+            if other_params:
+                param_groups.append(
+                    {
+                        "params": other_params,
+                        "lr": base_lr,
+                        "layer_idx": -1,
+                    }
+                )
+
+            self._adaptive_lr_step = 0
+            self._adaptive_layer_score_ema = None
+            self._adaptive_lr_multipliers = None
+
+            if self.rank == 0:
+                print(
+                    f"[AdaptiveLayerLR] initialized "
+                    f"{num_layers} layer groups, "
+                    f"base_lr={base_lr:.3e}"
+                )
+
+            return build_optimizer(
+                param_groups,
+                self.optimizer_config,
+            )
 
         # ------------------------------------------------------------
         # Normal VERL behavior
@@ -1039,7 +1294,21 @@ class FSDPEngine(BaseEngine):
         # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
         if scaler is not None:
             scaler.unscale_(self.optimizer)
-        
+
+
+        # ============================================================
+        # Adaptive layer LR: recompute Top-k energy every N optimizer
+        # updates. This analyzes gradients but never modifies them.
+        # ============================================================
+        if self.optimizer_config.adaptive_layer_lr_enabled:
+            self._adaptive_lr_step += 1
+
+            if (
+                self._adaptive_lr_step
+                % self.optimizer_config.adaptive_layer_lr_interval
+                == 0
+            ):
+                self._update_adaptive_layer_lr()
 
         # ==========================================
         # Lin experiment: per-step Top-10% SVD
@@ -1086,6 +1355,12 @@ class FSDPEngine(BaseEngine):
         Advance FSDP scheduler and return updated learning rate.
         """
         self.lr_scheduler.step()
+
+        # Scheduler owns the global schedule; reapply the stored adaptive
+        # layer multipliers so they persist between 10-step analyses.
+        if self.optimizer_config.adaptive_layer_lr_enabled:
+            self._apply_adaptive_layer_lr()
+
         lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
         return lr
 
