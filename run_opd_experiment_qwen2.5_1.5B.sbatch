@@ -30,7 +30,7 @@ set -euo pipefail
 # ============================================================
 
 if [[ $# -ne 2 ]]; then
-    echo "Usage: sbatch $0 <0.6B|1.5B> <baseline|global2x|layerwise|topk|both>"
+    echo "Usage: sbatch $0 <0.6B|1.5B> <baseline|global2x|layerwise|topk|both|adaptive>"
     exit 1
 fi
 
@@ -99,6 +99,7 @@ fi
 
 TOPK=false
 LAYERWISE=false
+ADAPTIVE=false
 
 case "${EXPERIMENT}" in
 
@@ -127,9 +128,15 @@ case "${EXPERIMENT}" in
         LAYERWISE=true
         ;;
 
+    adaptive)
+        TOPK=false
+        LAYERWISE=false
+        ADAPTIVE=true
+        ;;
+
     *)
         echo "ERROR: unknown EXPERIMENT=${EXPERIMENT}"
-        echo "Expected: baseline, global2x, layerwise, topk, or both"
+        echo "Expected: baseline, global2x, layerwise, topk, both, or adaptive"
         exit 1
         ;;
 esac
@@ -186,6 +193,11 @@ MIDDLE_LR_MULTIPLIER=2.0
 MIDDLE_LAYER_START_FRAC=0.3333333333
 MIDDLE_LAYER_END_FRAC=0.6666666667
 
+ADAPTIVE_LAYER_LR_INTERVAL=10
+ADAPTIVE_LAYER_LR_TOPK_RATIO=0.10
+ADAPTIVE_LAYER_LR_MAX_MULTIPLIER=2.0
+ADAPTIVE_LAYER_LR_EMA_BETA=0.90
+
 # Both Qwen3-0.6B and Qwen2.5-1.5B-Instruct have 28 transformer layers.
 #
 # floor(28 * 1/3) = 9
@@ -216,12 +228,17 @@ echo
 echo "Experiment:            ${EXPERIMENT}"
 echo "Top-k SVD enabled:     ${TOPK}"
 echo "Layerwise LR enabled:  ${LAYERWISE}"
+echo "Adaptive LR enabled:   ${ADAPTIVE}"
 echo
 echo "Base actor LR:         ${ACTOR_LR}"
 echo "Middle LR multiplier:  ${MIDDLE_LR_MULTIPLIER}"
 echo
 echo "Top-k ratio:           ${TOPK_SVD_RATIO}"
 echo "Top-k multiplier:      ${TOPK_SVD_MULTIPLIER}"
+echo "Adaptive interval:     ${ADAPTIVE_LAYER_LR_INTERVAL}"
+echo "Adaptive top-k ratio:  ${ADAPTIVE_LAYER_LR_TOPK_RATIO}"
+echo "Adaptive max mult:     ${ADAPTIVE_LAYER_LR_MAX_MULTIPLIER}"
+echo "Adaptive EMA beta:     ${ADAPTIVE_LAYER_LR_EMA_BETA}"
 echo
 echo "Train batch size:      ${TRAIN_BATCH_SIZE}"
 echo "PPO mini batch:        ${PPO_MINI_BATCH_SIZE}"
@@ -339,6 +356,12 @@ srun env \
     actor_rollout_ref.actor.optim.middle_lr_multiplier=${MIDDLE_LR_MULTIPLIER} \
     actor_rollout_ref.actor.optim.middle_layer_start_frac=${MIDDLE_LAYER_START_FRAC} \
     actor_rollout_ref.actor.optim.middle_layer_end_frac=${MIDDLE_LAYER_END_FRAC} \
+    \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_enabled=${ADAPTIVE} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_interval=${ADAPTIVE_LAYER_LR_INTERVAL} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_topk_ratio=${ADAPTIVE_LAYER_LR_TOPK_RATIO} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_max_multiplier=${ADAPTIVE_LAYER_LR_MAX_MULTIPLIER} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_ema_beta=${ADAPTIVE_LAYER_LR_EMA_BETA} \
     \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
