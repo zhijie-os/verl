@@ -358,7 +358,12 @@ class FSDPEngine(BaseEngine):
             ctrl.on_train_batch_begin(data)
         outputs = super().train_batch(data, loss_function)
         if ctrl is not None and ctrl.enabled and outputs is not None and "metrics" in outputs:
-            outputs["metrics"].update(ctrl.pop_metrics())
+            # engine_workers all-gathers metrics across dp ranks and then flattens per-micro-batch
+            # lists / aggregates Metric objects, so scalars must be wrapped as Metric (MEAN).
+            from verl.utils.metric import AggregationType, Metric
+
+            for key, value in ctrl.pop_metrics().items():
+                outputs["metrics"][key] = Metric(aggregation=AggregationType.MEAN, value=value)
         return outputs
 
     def initialize(self):
