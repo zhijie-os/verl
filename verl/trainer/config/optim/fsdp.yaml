@@ -71,3 +71,49 @@ adaptive_layer_lr_interval: 10
 adaptive_layer_lr_topk_ratio: 0.10
 adaptive_layer_lr_max_multiplier: 2.0
 adaptive_layer_lr_ema_beta: 0.90
+adaptive_layer_lr_score: topk_energy
+adaptive_layer_lr_score_scope: all
+adaptive_layer_lr_apply_scope: all
+adaptive_layer_lr_mapping: minmax
+adaptive_layer_lr_prior: none
+adaptive_layer_lr_gamma: 0.25
+adaptive_layer_lr_target_mean: -1.0
+adaptive_layer_lr_min_multiplier: 0.5
+adaptive_layer_lr_fit_profile: false
+adaptive_layer_lr_stability_ref: prev_window
+
+
+# Fixed depth-profile ladder
+layerwise_profile: window
+layerwise_center_frac: 0.5
+layerwise_width_frac: 0.1666666667
+layerwise_module_scope: all
+periphery_lr_multiplier: 1.0
+other_lr_multiplier: 1.0
+
+
+# Utility-probe controller
+utility_probe_enabled: false
+utility_probe_interval: 20
+utility_probe_num_blocks: 4
+utility_probe_module_scope: all
+utility_probe_mode: leave_one_out
+utility_probe_ema_beta: 0.7
+utility_probe_normalize_by_norm: true
+utility_probe_gamma: 0.5
+probe_objective: adv_logp
+
+
+# Block-wise extrapolation
+block_extrap_enabled: false
+block_extrap_schedule: exp
+block_extrap_interval: 50
+block_extrap_first_step: 1
+block_extrap_max_step: -1
+block_extrap_num_blocks: 4
+block_extrap_module_scope: all
+block_extrap_alphas: "1,2,4,8"
+block_extrap_tolerance: 0.0
+block_extrap_max_kl: 0.05
+block_extrap_order: middle_out
+block_extrap_feedback_lr: false

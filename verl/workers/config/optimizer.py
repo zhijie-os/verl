@@ -137,6 +137,72 @@ class FSDPOptimizerConfig(OptimizerConfig):
     adaptive_layer_lr_topk_ratio: float = 0.10
     adaptive_layer_lr_max_multiplier: float = 2.0
     adaptive_layer_lr_ema_beta: float = 0.90
+    # score: "topk_energy" (original run) | "direction_stability" (cosine of successive
+    # per-layer weight displacements, Property 2 of the EffOPD paper at layer level)
+    adaptive_layer_lr_score: str = "topk_energy"
+    # which 2-D matrices contribute to a layer's score / which module kinds receive the
+    # multiplier: "all" | "mlp" | "attn"
+    adaptive_layer_lr_score_scope: str = "all"
+    adaptive_layer_lr_apply_scope: str = "all"
+    # mapping from score to multiplier: "minmax" (original: 1 + minmax(score) * (max - 1))
+    # | "prior_exp" (prior * exp(gamma * z), clamped, renormalised to target mean)
+    adaptive_layer_lr_mapping: str = "minmax"
+    # prior for "prior_exp": "none" (all ones) | "profile" (the layerwise_* fixed profile)
+    adaptive_layer_lr_prior: str = "none"
+    adaptive_layer_lr_gamma: float = 0.25
+    # mean multiplier over layers after renormalisation (<= 0 disables renormalisation);
+    # the original layerwise run has mean (10 * 2 + 18 * 1) / 28 = 1.36
+    adaptive_layer_lr_target_mean: float = -1.0
+    adaptive_layer_lr_min_multiplier: float = 0.5
+    # replace the L noisy per-layer values by a fitted Gaussian bump (3 parameters)
+    adaptive_layer_lr_fit_profile: bool = False
+    # reference displacement for direction_stability: "prev_window" | "cumulative" (W_t - W_0)
+    adaptive_layer_lr_stability_ref: str = "prev_window"
+
+    # ============================================================
+    # Fixed depth-profile ladder (extends the layer-wise experiment)
+    # ============================================================
+    # "window" reproduces the original layerwise run; "gaussian" / "cosine" are smooth bumps
+    layerwise_profile: str = "window"
+    layerwise_center_frac: float = 0.5
+    layerwise_width_frac: float = 0.1666666667
+    # which module kinds inside the boosted layers receive the multiplier: "all" | "mlp" | "attn"
+    layerwise_module_scope: str = "all"
+    # multiplier for the layers outside the window (0.0 freezes them)
+    periphery_lr_multiplier: float = 1.0
+    # multiplier for non-layer parameters: embeddings, lm_head, final norm (0.0 freezes them)
+    other_lr_multiplier: float = 1.0
+
+    # ============================================================
+    # Utility-probe controller (leave-one-block-out on the current mini-batch)
+    # ============================================================
+    utility_probe_enabled: bool = False
+    utility_probe_interval: int = 20  # optimizer updates between probes
+    utility_probe_num_blocks: int = 4
+    utility_probe_module_scope: str = "all"
+    utility_probe_mode: str = "leave_one_out"  # | "inject" (W_0 + dW_b only)
+    utility_probe_ema_beta: float = 0.7
+    utility_probe_normalize_by_norm: bool = True  # utility per unit ||dW_b||
+    utility_probe_gamma: float = 0.5
+    # probe objective shared by utility probes and block extrapolation:
+    # "adv_logp" (sum A_t log pi / sum |A_t|) | "pos_logp" (mean log pi of positive-advantage tokens)
+    probe_objective: str = "adv_logp"
+
+    # ============================================================
+    # Block-wise EffOPD-style extrapolation
+    # ============================================================
+    block_extrap_enabled: bool = False
+    block_extrap_schedule: str = "exp"  # "exp": at optimizer updates 1, 2, 4, ... | "interval"
+    block_extrap_interval: int = 50
+    block_extrap_first_step: int = 1
+    block_extrap_max_step: int = -1  # stop extrapolating after this many updates (<= 0: never)
+    block_extrap_num_blocks: int = 4
+    block_extrap_module_scope: str = "all"
+    block_extrap_alphas: str = "1,2,4,8"  # W + alpha * (W - W_prev), tried in ascending order
+    block_extrap_tolerance: float = 0.0  # accept while J >= J_best - tolerance
+    block_extrap_max_kl: float = 0.05  # k3 KL bound to the pre-extrapolation policy
+    block_extrap_order: str = "middle_out"  # | "stability" | "bottom_up" | "top_down"
+    block_extrap_feedback_lr: bool = False  # accepted alphas -> LR multipliers
 
 
     def __post_init__(self):
