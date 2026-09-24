@@ -19,9 +19,10 @@ set -euo pipefail
 #
 # Paths are taken from the directory you submit from (SLURM_SUBMIT_DIR): the repo is that
 # directory, logs go to <repo>/logs (create it once; Slurm needs it before the job starts), the
-# virtualenv is <repo>/VERL, models are looked up in <repo>/models then ~/models, and the GSM8K
+# virtualenv is ~/verl/VERL, models are looked up in <repo>/models then ~/models, and the GSM8K
 # parquet files in <repo>/data/gsm8k then ~/data/gsm8k. Override with VENV_DIR, MODELS_DIR,
-# DATA_DIR in the environment.
+# DATA_DIR in the environment. PYTHONPATH is set to the repo, so the checkout you submit from is
+# the verl that runs, whichever checkout the venv was pip-installed from.
 #
 # Original runs
 #   baseline        lr 5e-7 everywhere
@@ -85,7 +86,7 @@ module load opencv/4.14.0
 # ============================================================
 
 REPO_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
-VENV_DIR="${VENV_DIR:-${REPO_DIR}/VERL}"
+VENV_DIR="${VENV_DIR:-${HOME}/verl/VERL}"
 
 if [[ ! -f "${REPO_DIR}/run_opd_experiment_qwen2.5_1.5B.sbatch" ]]; then
     echo "ERROR: submit this script from the repo root (got REPO_DIR=${REPO_DIR})"
@@ -98,6 +99,11 @@ fi
 
 cd "${REPO_DIR}"
 source "${VENV_DIR}/bin/activate"
+
+# The checkout you submit from is the verl that runs -- in the driver and in every Ray worker --
+# regardless of which directory the venv's editable install points at. (One venv, many branches:
+# ~/opd, ~/continual, ...; the job header prints the resolved verl path.)
+export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 export HYDRA_FULL_ERROR=1
 
