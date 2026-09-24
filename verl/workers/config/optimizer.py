@@ -156,8 +156,13 @@ class FSDPOptimizerConfig(OptimizerConfig):
     adaptive_layer_lr_min_multiplier: float = 0.5
     # replace the L noisy per-layer values by a fitted Gaussian bump (3 parameters)
     adaptive_layer_lr_fit_profile: bool = False
-    # reference displacement for direction_stability: "prev_window" | "cumulative" (W_t - W_0)
+    # reference for direction_stability: "prev_window" (previous window's displacement; correlated
+    # with the current one through Adam momentum in every layer alike) | "cumulative"
+    # (W(t_{n-1}) - W_0, the paper's alignment measure, free of momentum carry-over)
     adaptive_layer_lr_stability_ref: str = "prev_window"
+    # minimum across-layer std used when standardising scores; a flat profile then stays flat
+    # instead of being amplified into +-2 (0 = plain z-score)
+    adaptive_layer_lr_z_floor: float = 0.0
 
     # ============================================================
     # Fixed depth-profile ladder (extends the layer-wise experiment)

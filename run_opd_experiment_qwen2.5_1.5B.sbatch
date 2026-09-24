@@ -37,10 +37,16 @@ set -euo pipefail
 # Adaptive methods (see claude/adaptive-layer-lr-next-steps.md in the project)
 #   stability       5.1  direction-stability score (cos of successive per-layer displacements),
 #                        prior = layerwise profile, budget-neutral (mean multiplier 1.36)
-#   stability_mlp   5.1  same, scoring / boosting MLP matrices only
-#   stability_flat  5.1  same signal, no prior, mean multiplier 1.0 (pure reallocation)
+#                        [first run: cos ~0.5 in every layer -- adjacent Adam windows are momentum-
+#                        correlated alike everywhere -- so it behaved like layerwise + noise]
+#   stability_cum   5.1  cosine against the accumulated direction W(t-window) - W_0 instead (the
+#                        paper's alignment measure), flat profiles stay flat (z floor 0.05)
+#   stability_mlp   5.1  stability_cum, scoring / boosting MLP matrices only
+#   stability_flat  5.1  stability_cum signal, no prior, mean multiplier 1.0 (pure reallocation)
 #   utility         5.2  leave-one-block-out utility probes every 20 updates -> block multipliers
 #   extrap          5.3  block-wise EffOPD extrapolation at updates 1, 2, 4, ... (4 blocks)
+#                        [first run: fastest start of all runs but KL bound 0.05 let it over-drift]
+#   extrap_early    5.3  same with KL bound 0.01, alphas 1,2,4 and no events after update 128
 #   extrap_global   5.3  the same with a single block (global EffOPD-style control)
 #   extrap_stab     5.3  block-wise extrapolation ordered by the stability score (+ 5.1)
 #   fitprofile      5.4  stability signal smoothed by a fitted 3-parameter Gaussian bump
@@ -132,17 +138,26 @@ ROLLOUT_N=4
 # 2 epochs ~= 466 steps
 TOTAL_EPOCHS=2
 
-# -1 keeps no checkpoint. Set SAVE_FREQ=466 (env) to keep the final actor, e.g. to use a
-# GRPO-trained checkpoint as the OPD teacher (the paper's recipe).
-SAVE_FREQ="${SAVE_FREQ:--1}"
-TEST_FREQ="${TEST_FREQ:-10}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+SAVE_FREQ=-1             # never save a checkpoint (466 would keep the final actor, e.g. as an OPD teacher)
+TEST_FREQ=10             # validate every 10 steps
+VAL_BEFORE_TRAIN=True    # validate at step 0
 
-# Smoke test of the new machinery without a 5-hour run, e.g.
-#   TOTAL_TRAINING_STEPS=12 VAL_BEFORE_TRAIN=False TEST_FREQ=6 sbatch ... 1.5B extrap
+# Optional smoke test of the new machinery without a 5-hour run:
+#   SMOKE_STEPS=12 sbatch run_opd_experiment_qwen2.5_1.5B.sbatch 1.5B extrap
+# runs 12 steps, skips the step-0 validation and validates every 6 steps.
 EXTRA_ARGS=()
-if [[ -n "${TOTAL_TRAINING_STEPS:-}" ]]; then
-    EXTRA_ARGS+=("trainer.total_training_steps=${TOTAL_TRAINING_STEPS}")
+if [[ -n "${SMOKE_STEPS:-}" ]]; then
+    EXTRA_ARGS+=("trainer.total_training_steps=${SMOKE_STEPS}")
+    VAL_BEFORE_TRAIN=False
+    TEST_FREQ=$(( SMOKE_STEPS / 2 ))
+fi
+
+# Optional repeat with a different data-shuffle seed (verl default 42); the run is logged as
+# <experiment>_seed<N> so it sits next to the original in TensorBoard:
+#   SEED=1 sbatch run_opd_experiment_qwen2.5_1.5B.sbatch 1.5B layerwise
+SEED="${SEED:-}"
+if [[ -n "${SEED}" ]]; then
+    EXTRA_ARGS+=("data.seed=${SEED}")
 fi
 
 # ============================================================
@@ -179,6 +194,7 @@ ADAPTIVE_MIN_MULT=0.5
 ADAPTIVE_MAX_MULT=2.0
 ADAPTIVE_FIT_PROFILE=false
 ADAPTIVE_STABILITY_REF=prev_window  # prev_window | cumulative
+ADAPTIVE_Z_FLOOR=0.0                # min across-layer std when standardising (0 = plain z-score)
 ADAPTIVE_LAYER_LR_INTERVAL=10       # optimizer updates (2 per training step here)
 ADAPTIVE_LAYER_LR_TOPK_RATIO=0.10
 ADAPTIVE_LAYER_LR_EMA_BETA=0.90
@@ -298,14 +314,24 @@ case "${EXPERIMENT}" in
         enable_stability
         ;;
 
+    stability_cum)
+        enable_stability
+        ADAPTIVE_STABILITY_REF=cumulative
+        ADAPTIVE_Z_FLOOR=0.05
+        ;;
+
     stability_mlp)
         enable_stability
+        ADAPTIVE_STABILITY_REF=cumulative
+        ADAPTIVE_Z_FLOOR=0.05
         ADAPTIVE_SCORE_SCOPE=mlp
         ADAPTIVE_APPLY_SCOPE=mlp
         ;;
 
     stability_flat)
         enable_stability
+        ADAPTIVE_STABILITY_REF=cumulative
+        ADAPTIVE_Z_FLOOR=0.05
         ADAPTIVE_PRIOR=none
         ADAPTIVE_TARGET_MEAN=1.0
         ;;
@@ -329,15 +355,29 @@ case "${EXPERIMENT}" in
         EXTRAP_NUM_BLOCKS=1
         ;;
 
+    extrap_early)
+        EXTRAP=true
+        EXTRAP_ALPHAS="1,2,4"
+        EXTRAP_MAX_KL=0.01
+        EXTRAP_MAX_STEP=128
+        ;;
+
     extrap_stab)
         EXTRAP=true
+        EXTRAP_ALPHAS="1,2,4"
+        EXTRAP_MAX_KL=0.01
+        EXTRAP_MAX_STEP=128
         EXTRAP_ORDER=stability
         enable_stability
+        ADAPTIVE_STABILITY_REF=cumulative
+        ADAPTIVE_Z_FLOOR=0.05
         ;;
 
     # ---------------- 5.4 parametric profile ----------------
     fitprofile)
         enable_stability
+        ADAPTIVE_STABILITY_REF=cumulative
+        ADAPTIVE_Z_FLOOR=0.05
         ADAPTIVE_FIT_PROFILE=true
         ;;
 
@@ -377,6 +417,9 @@ if [[ "${MODEL_SIZE}" == "1.5B" ]]; then
     EXPERIMENT_NAME="${EXPERIMENT}_qwen2.5_${MODEL_SIZE}_instruct"
 else
     EXPERIMENT_NAME="${EXPERIMENT}_qwen3_${MODEL_SIZE}"
+fi
+if [[ -n "${SEED}" ]]; then
+    EXPERIMENT_NAME="${EXPERIMENT_NAME}_seed${SEED}"
 fi
 
 # ============================================================
@@ -418,6 +461,8 @@ echo "Rollout n:             ${ROLLOUT_N}"
 echo "vLLM GPU utilization:  ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
 echo "Total epochs:          ${TOTAL_EPOCHS}"
 echo "Save freq / test freq: ${SAVE_FREQ} / ${TEST_FREQ}  (val before train: ${VAL_BEFORE_TRAIN})"
+echo "Data seed:             ${SEED:-42 (default)}"
+echo "Run name:              ${EXPERIMENT_NAME}"
 echo "Expected steps:        ~466"
 echo
 echo "Train dataset:         ${TRAIN_FILE}"
@@ -547,6 +592,7 @@ srun env \
     actor_rollout_ref.actor.optim.adaptive_layer_lr_max_multiplier=${ADAPTIVE_MAX_MULT} \
     actor_rollout_ref.actor.optim.adaptive_layer_lr_fit_profile=${ADAPTIVE_FIT_PROFILE} \
     actor_rollout_ref.actor.optim.adaptive_layer_lr_stability_ref=${ADAPTIVE_STABILITY_REF} \
+    actor_rollout_ref.actor.optim.adaptive_layer_lr_z_floor=${ADAPTIVE_Z_FLOOR} \
     actor_rollout_ref.actor.optim.adaptive_layer_lr_interval=${ADAPTIVE_LAYER_LR_INTERVAL} \
     actor_rollout_ref.actor.optim.adaptive_layer_lr_topk_ratio=${ADAPTIVE_LAYER_LR_TOPK_RATIO} \
     actor_rollout_ref.actor.optim.adaptive_layer_lr_ema_beta=${ADAPTIVE_LAYER_LR_EMA_BETA} \

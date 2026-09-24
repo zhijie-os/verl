@@ -136,8 +136,11 @@ def depth_bump(num_layers: int, profile: str, start_frac: float, end_frac: float
     raise ValueError(f"unknown layerwise_profile={profile!r} (window | gaussian | cosine)")
 
 
-def standardize(x: torch.Tensor, clamp: float = 2.0) -> torch.Tensor:
-    z = (x - x.mean()) / (x.std(unbiased=False) + 1e-8)
+def standardize(x: torch.Tensor, clamp: float = 2.0, floor: float = 0.0) -> torch.Tensor:
+    """(x - mean) / max(std, floor), clamped.  A positive floor keeps a flat profile flat instead of
+    amplifying its noise into +-clamp (the failure mode of the first stability run)."""
+    scale = torch.maximum(x.std(unbiased=False), torch.tensor(float(floor), dtype=x.dtype)) + 1e-8
+    z = (x - x.mean()) / scale
     return z.clamp(-clamp, clamp)
 
 
@@ -262,6 +265,7 @@ class LayerLRController:
         self.max_mult = float(cfg.adaptive_layer_lr_max_multiplier)
         self.fit_profile = bool(getattr(cfg, "adaptive_layer_lr_fit_profile", False))
         self.stability_ref = getattr(cfg, "adaptive_layer_lr_stability_ref", "prev_window")
+        self.z_floor = float(getattr(cfg, "adaptive_layer_lr_z_floor", 0.0))
         self.ema_beta = float(cfg.adaptive_layer_lr_ema_beta)
         self.interval = int(cfg.adaptive_layer_lr_interval)
 
@@ -526,7 +530,10 @@ class LayerLRController:
             self._metrics[f"layer_lr/score/l{l:02d}"] = self._score_ema[l].item()
 
     def _update_direction_stability(self):
-        """cos(D_l^(n), D_l^(n-1)) with D^(n) = W(t_n) - W(t_{n-1}) (or W(t_n) - W_0 as reference)."""
+        """cos(D_l^(n), ref_l) with D^(n) = W(t_n) - W(t_{n-1}) and ref = D^(n-1) ('prev_window') or
+        W(t_{n-1}) - W_0 ('cumulative').  Adjacent Adam windows are correlated through momentum
+        (beta1 = 0.9 has the same ~10-update memory as the window) identically in every layer, which
+        makes 'prev_window' nearly flat across depth; 'cumulative' is the paper's alignment measure."""
         dots = torch.zeros(self.L, dtype=torch.float64)
         n_cur = torch.zeros(self.L, dtype=torch.float64)
         n_ref = torch.zeros(self.L, dtype=torch.float64)
@@ -540,7 +547,10 @@ class LayerLRController:
                 continue
             d = w - self._w_prev[name]  # displacement over the last window (fp32)
             if self.stability_ref == "cumulative":
-                ref = w - self._w0_scored[name]
+                # long-run direction accumulated *before* this window: W(t_{n-1}) - W_0
+                ref = self._w_prev[name] - self._w0_scored[name]
+                if not torch.any(ref != 0):
+                    ref = None
             else:
                 ref = self._d_prev.get(name)
                 ref = None if ref is None else ref.float()
@@ -557,7 +567,7 @@ class LayerLRController:
         cos = dots / (torch.sqrt(n_cur) * torch.sqrt(n_ref) + 1e-30)
         cos = torch.nan_to_num(cos, nan=0.0).clamp(-1.0, 1.0)
         self._ema_update(cos)
-        self._stab_z = standardize(self._score_ema)
+        self._stab_z = standardize(self._score_ema, floor=self.z_floor)
         for l in range(self.L):
             self._metrics[f"layer_lr/score/l{l:02d}"] = self._score_ema[l].item()
         if self.rank == 0:

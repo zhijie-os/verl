@@ -81,6 +81,7 @@ adaptive_layer_lr_target_mean: -1.0
 adaptive_layer_lr_min_multiplier: 0.5
 adaptive_layer_lr_fit_profile: false
 adaptive_layer_lr_stability_ref: prev_window
+adaptive_layer_lr_z_floor: 0.0
 
 
 # Fixed depth-profile ladder

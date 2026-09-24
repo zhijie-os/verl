@@ -134,6 +134,7 @@ _DEFAULTS = dict(
     adaptive_layer_lr_min_multiplier=0.5,
     adaptive_layer_lr_fit_profile=False,
     adaptive_layer_lr_stability_ref="prev_window",
+    adaptive_layer_lr_z_floor=0.0,
     layerwise_profile="window",
     layerwise_center_frac=0.5,
     layerwise_width_frac=1.0 / 6.0,
@@ -364,6 +365,44 @@ def test_direction_stability_scores_and_prior_exp_mapping():
     assert math.isclose(mult.mean().item(), 1.0, rel_tol=0.05)  # budget-neutral
     m = ctrl.pop_metrics()
     assert "layer_lr/score/l00" in m and "layer_lr/mult/l05" in m
+
+
+def test_direction_stability_cumulative_reference_and_z_floor():
+    L = 6
+    model, engine, ctrl = make_setup(
+        L=L,
+        adaptive_layer_lr_enabled=True,
+        adaptive_layer_lr_interval=1,
+        adaptive_layer_lr_score="direction_stability",
+        adaptive_layer_lr_stability_ref="cumulative",
+        adaptive_layer_lr_mapping="prior_exp",
+        adaptive_layer_lr_gamma=0.5,
+        adaptive_layer_lr_target_mean=1.0,
+        adaptive_layer_lr_max_multiplier=3.0,
+        adaptive_layer_lr_ema_beta=0.0,
+    )
+    torch.manual_seed(4)
+    directions = {n: torch.randn_like(p) for n, p in model.named_parameters()}
+    with torch.no_grad():
+        for step in range(3):
+            for l in range(L):
+                for n, p in _layer_params(model, l):
+                    if l < 3:
+                        p.add_(1e-3 * directions[n])  # keeps moving along its accumulated direction
+                    else:
+                        p.add_(1e-3 * torch.randn_like(p))  # wanders
+            ctrl.on_optimizer_step()
+    # scored from the 2nd measurement on: window 2 vs the accumulated window 1
+    cos = ctrl._score_ema
+    assert cos is not None
+    assert all(cos[l].item() > 0.99 for l in range(3)), cos
+    assert all(abs(cos[l].item()) < 0.3 for l in range(3, 6)), cos
+    assert all(ctrl.layer_mult[l].item() > ctrl.layer_mult[k].item() for l in range(3) for k in range(3, 6))
+
+    # z floor: a flat profile must not be amplified into +-2
+    flat = torch.tensor([0.50, 0.51, 0.50, 0.49, 0.50, 0.51], dtype=torch.float64)
+    assert lle.standardize(flat).abs().max().item() > 1.0  # plain z-score: noise looks like signal
+    assert lle.standardize(flat, floor=0.05).abs().max().item() < 0.25  # floored: stays near the prior
 
 
 def test_layerwise_plus_adaptive_uses_profile_as_prior_until_first_score():
