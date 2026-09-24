@@ -6,8 +6,8 @@
 #SBATCH --mem=96G
 #SBATCH --gpus-per-node=l40s:1
 #SBATCH --time=24:00:00
-#SBATCH --output=/home/zhijiex/verl/logs/%x-%j.out
-#SBATCH --error=/home/zhijiex/verl/logs/%x-%j.err
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
 
 set -euo pipefail
 
@@ -15,7 +15,13 @@ set -euo pipefail
 # Usage
 # ============================================================
 #
-#   sbatch run_opd_experiment_qwen2.5_1.5B.sbatch <0.6B|1.5B> <experiment>
+#   cd <repo root>  &&  mkdir -p logs  &&  sbatch run_opd_experiment_qwen2.5_1.5B.sbatch <0.6B|1.5B> <experiment>
+#
+# Paths are taken from the directory you submit from (SLURM_SUBMIT_DIR): the repo is that
+# directory, logs go to <repo>/logs (create it once; Slurm needs it before the job starts), the
+# virtualenv is <repo>/VERL, models are looked up in <repo>/models then ~/models, and the GSM8K
+# parquet files in <repo>/data/gsm8k then ~/data/gsm8k. Override with VENV_DIR, MODELS_DIR,
+# DATA_DIR in the environment.
 #
 # Original runs
 #   baseline        lr 5e-7 everywhere
@@ -78,21 +84,57 @@ module load opencv/4.14.0
 # VERL environment
 # ============================================================
 
-cd /home/zhijiex/verl
-source /home/zhijiex/verl/VERL/bin/activate
+REPO_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+VENV_DIR="${VENV_DIR:-${REPO_DIR}/VERL}"
+
+if [[ ! -f "${REPO_DIR}/run_opd_experiment_qwen2.5_1.5B.sbatch" ]]; then
+    echo "ERROR: submit this script from the repo root (got REPO_DIR=${REPO_DIR})"
+    exit 1
+fi
+if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
+    echo "ERROR: virtualenv not found at ${VENV_DIR} (set VENV_DIR=/path/to/venv)"
+    exit 1
+fi
+
+cd "${REPO_DIR}"
+source "${VENV_DIR}/bin/activate"
 
 export HYDRA_FULL_ERROR=1
 
-mkdir -p /home/zhijiex/verl/logs
+mkdir -p "${REPO_DIR}/logs"
 
 # ============================================================
 # Model-dependent settings
 # ============================================================
 
+# first existing directory among the candidates (or empty)
+first_existing_dir() {
+    local d
+    for d in "$@"; do
+        if [[ -n "${d}" && -d "${d}" ]]; then
+            echo "${d}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+MODELS_DIR="$(first_existing_dir "${MODELS_DIR:-}" "${REPO_DIR}/models" "${HOME}/opd/models" "${HOME}/models")"
+DATA_DIR="$(first_existing_dir "${DATA_DIR:-}" "${REPO_DIR}/data/gsm8k" "${HOME}/opd/data/gsm8k" "${HOME}/data/gsm8k")"
+
+if [[ -z "${MODELS_DIR}" ]]; then
+    echo "ERROR: no models directory found (set MODELS_DIR=/path/to/models)"
+    exit 1
+fi
+if [[ -z "${DATA_DIR}" ]]; then
+    echo "ERROR: no gsm8k data directory found (set DATA_DIR=/path/to/gsm8k)"
+    exit 1
+fi
+
 case "${MODEL_SIZE}" in
 
     0.6B)
-        MODEL_PATH="/home/zhijiex/models/Qwen3-0.6B"
+        MODEL_PATH="${MODELS_DIR}/Qwen3-0.6B"
 
         PPO_MICRO_BATCH_SIZE=2
         LOGPROB_MICRO_BATCH_SIZE=4
@@ -100,7 +142,7 @@ case "${MODEL_SIZE}" in
         ;;
 
     1.5B)
-        MODEL_PATH="/home/zhijiex/models/Qwen2.5-1.5B-Instruct"
+        MODEL_PATH="${MODELS_DIR}/Qwen2.5-1.5B-Instruct"
 
         PPO_MICRO_BATCH_SIZE=2
         LOGPROB_MICRO_BATCH_SIZE=4
@@ -152,12 +194,16 @@ if [[ -n "${SMOKE_STEPS:-}" ]]; then
     TEST_FREQ=$(( SMOKE_STEPS / 2 ))
 fi
 
-# Optional repeat with a different data-shuffle seed (verl default 42); the run is logged as
-# <experiment>_seed<N> so it sits next to the original in TensorBoard:
+# Optional independent repeat: SEED=N moves the three seeds that matter for training
+# (prompt order: data.seed, default null = PyTorch's fixed generator state; vLLM sampling:
+# rollout.seed, default 42; mini-batch shuffling: actor.data_loader_seed, default 42) and logs
+# the run as <experiment>_seed<N> next to the original in TensorBoard:
 #   SEED=1 sbatch run_opd_experiment_qwen2.5_1.5B.sbatch 1.5B layerwise
 SEED="${SEED:-}"
 if [[ -n "${SEED}" ]]; then
     EXTRA_ARGS+=("data.seed=${SEED}")
+    EXTRA_ARGS+=("actor_rollout_ref.rollout.seed=${SEED}")
+    EXTRA_ARGS+=("actor_rollout_ref.actor.data_loader_seed=${SEED}")
 fi
 
 # ============================================================
@@ -391,8 +437,8 @@ esac
 # Dataset
 # ============================================================
 
-TRAIN_FILE="/home/zhijiex/data/gsm8k/train.parquet"
-VAL_FILE="/home/zhijiex/data/gsm8k/test.parquet"
+TRAIN_FILE="${DATA_DIR}/train.parquet"
+VAL_FILE="${DATA_DIR}/test.parquet"
 
 if [[ ! -f "${TRAIN_FILE}" ]]; then
     echo "ERROR: train dataset not found:"
@@ -432,6 +478,8 @@ echo "                  OPD-RL EXPERIMENT"
 echo "============================================================"
 echo "SLURM job ID:          ${SLURM_JOB_ID}"
 echo "Hostname:              $(hostname)"
+echo "Repo / venv:           ${REPO_DIR} / ${VENV_DIR}"
+echo "Models / data:         ${MODELS_DIR} / ${DATA_DIR}"
 echo
 echo "Model size:            ${MODEL_SIZE}"
 echo "Model path:            ${MODEL_PATH}"
@@ -461,7 +509,7 @@ echo "Rollout n:             ${ROLLOUT_N}"
 echo "vLLM GPU utilization:  ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
 echo "Total epochs:          ${TOTAL_EPOCHS}"
 echo "Save freq / test freq: ${SAVE_FREQ} / ${TEST_FREQ}  (val before train: ${VAL_BEFORE_TRAIN})"
-echo "Data seed:             ${SEED:-42 (default)}"
+echo "Seed:                  ${SEED:-defaults (data null, rollout 42, mini-batch 42)}"
 echo "Run name:              ${EXPERIMENT_NAME}"
 echo "Expected steps:        ~466"
 echo
